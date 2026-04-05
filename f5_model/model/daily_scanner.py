@@ -16,13 +16,22 @@ Usage:
     # With manual odds from CSV file
     python -m f5_model.model.daily_scanner --date 2026-04-04 --odds-file odds.csv
 
+    # With full manual input (pitcher IDs, lineup IDs, odds) from CSV
+    python -m f5_model.model.daily_scanner --date 2026-04-04 --games-file games.csv
+
     # Interactive mode - prompt for odds
     python -m f5_model.model.daily_scanner --date 2026-04-04 --manual-odds
 
-CSV Format for odds file:
+CSV Format for odds file (odds only, lineups from MLB API):
     away_team,home_team,away_ml,home_ml,total,over_odds,under_odds
     NYY,BOS,-150,+130,4.5,-110,-110
     LAD,SF,+120,-140,5.0,-105,-115
+
+CSV Format for games file (full manual input with MLB IDs):
+    away_team,home_team,away_pitcher_id,away_pitcher_hand,home_pitcher_id,home_pitcher_hand,away_lineup_ids,home_lineup_ids,away_ml,home_ml,total,over_odds,under_odds
+    CIN,TEX,669270,R,666201,R,"669016,663460,683658,664702,672284,608369,673357,670868,687093","543760,608369,686780,683002,666971,683734,682998,681082,660670",-110,-110,4.5,-110,-110
+
+Note: Lineup IDs should be comma-separated MLB player IDs in batting order, quoted if using commas.
 """
 
 import argparse
@@ -60,6 +69,25 @@ class ManualOdds:
     """Odds entered manually or from CSV."""
     away_team: str
     home_team: str
+    away_ml: Optional[int] = None
+    home_ml: Optional[int] = None
+    total: Optional[float] = None
+    over_odds: Optional[int] = None
+    under_odds: Optional[int] = None
+
+
+@dataclass
+class ManualGame:
+    """Full game input with pitcher IDs, lineup IDs, and odds."""
+    away_team: str
+    home_team: str
+    away_pitcher_id: int
+    away_pitcher_hand: str
+    home_pitcher_id: int
+    home_pitcher_hand: str
+    away_lineup_ids: List[int]
+    home_lineup_ids: List[int]
+    # Optional odds
     away_ml: Optional[int] = None
     home_ml: Optional[int] = None
     total: Optional[float] = None
@@ -106,6 +134,63 @@ def parse_odds_csv(filepath: str) -> Dict[str, ManualOdds]:
                 continue
 
     return odds
+
+
+def parse_games_csv(filepath: str) -> List[ManualGame]:
+    """
+    Parse full game inputs from a CSV file.
+
+    Expected columns:
+        away_team, home_team, away_pitcher_id, away_pitcher_hand,
+        home_pitcher_id, home_pitcher_hand, away_lineup_ids, home_lineup_ids,
+        away_ml, home_ml, total, over_odds, under_odds
+
+    Lineup IDs should be comma-separated MLB player IDs.
+
+    Returns:
+        List of ManualGame objects
+    """
+    games = []
+
+    with open(filepath, 'r') as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            try:
+                away = row['away_team'].strip().upper()
+                home = row['home_team'].strip().upper()
+
+                # Parse lineup IDs (comma-separated within the field)
+                away_lineup_str = row.get('away_lineup_ids', '').strip()
+                home_lineup_str = row.get('home_lineup_ids', '').strip()
+
+                away_lineup_ids = [int(x.strip()) for x in away_lineup_str.split(',') if x.strip()]
+                home_lineup_ids = [int(x.strip()) for x in home_lineup_str.split(',') if x.strip()]
+
+                game = ManualGame(
+                    away_team=away,
+                    home_team=home,
+                    away_pitcher_id=int(row['away_pitcher_id']),
+                    away_pitcher_hand=row.get('away_pitcher_hand', 'R').strip().upper(),
+                    home_pitcher_id=int(row['home_pitcher_id']),
+                    home_pitcher_hand=row.get('home_pitcher_hand', 'R').strip().upper(),
+                    away_lineup_ids=away_lineup_ids,
+                    home_lineup_ids=home_lineup_ids,
+                    away_ml=int(row['away_ml']) if row.get('away_ml') else None,
+                    home_ml=int(row['home_ml']) if row.get('home_ml') else None,
+                    total=float(row['total']) if row.get('total') else None,
+                    over_odds=int(row['over_odds']) if row.get('over_odds') else None,
+                    under_odds=int(row['under_odds']) if row.get('under_odds') else None
+                )
+
+                games.append(game)
+                logger.info(f"  Loaded game: {away} @ {home}")
+
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Skipping invalid row: {row} - {e}")
+                continue
+
+    return games
 
 
 def prompt_for_odds(games: List[Tuple[str, str]]) -> Dict[str, ManualOdds]:
@@ -402,6 +487,82 @@ def predict_game(
         return None
 
 
+def predict_manual_game(
+    model,
+    feature_names: List[str],
+    game: ManualGame,
+    date: str,
+    park: str = None
+) -> Optional[GamePrediction]:
+    """
+    Run prediction for a manually specified game (with MLB IDs).
+
+    Args:
+        model: Trained model
+        feature_names: Feature names
+        game: ManualGame object with pitcher IDs and lineup IDs
+        date: Game date
+        park: Park code (defaults to home team)
+
+    Returns:
+        GamePrediction or None if can't predict
+    """
+    if len(game.away_lineup_ids) < 5 or len(game.home_lineup_ids) < 5:
+        logger.warning(f"Skipping {game.away_team} @ {game.home_team}: not enough batters in lineup")
+        return None
+
+    park_code = park or game.home_team
+
+    try:
+        # Away team runs = Home pitcher vs Away lineup
+        away_result = predict_f5_runs(
+            model=model,
+            feature_names=feature_names,
+            pitcher_id=game.home_pitcher_id,
+            pitcher_hand=game.home_pitcher_hand,
+            lineup_ids=game.away_lineup_ids,
+            date=date,
+            starter_is_home=True,
+            park=park_code
+        )
+
+        # Home team runs = Away pitcher vs Home lineup
+        home_result = predict_f5_runs(
+            model=model,
+            feature_names=feature_names,
+            pitcher_id=game.away_pitcher_id,
+            pitcher_hand=game.away_pitcher_hand,
+            lineup_ids=game.home_lineup_ids,
+            date=date,
+            starter_is_home=False,
+            park=park_code
+        )
+
+        away_lambda = away_result['predicted_runs']
+        home_lambda = home_result['predicted_runs']
+
+        probs = compute_game_probs(away_lambda, home_lambda)
+
+        return GamePrediction(
+            away_team=game.away_team,
+            home_team=game.home_team,
+            away_pitcher=f"ID:{game.away_pitcher_id}",
+            home_pitcher=f"ID:{game.home_pitcher_id}",
+            away_runs=away_lambda,
+            home_runs=home_lambda,
+            total=away_lambda + home_lambda,
+            away_win_prob=probs['away_ml'],
+            home_win_prob=probs['home_ml'],
+            tie_prob=probs['tie'],
+            game_time="",
+            edges={'probs': probs}
+        )
+
+    except Exception as e:
+        logger.error(f"Error predicting {game.away_team} @ {game.home_team}: {e}")
+        return None
+
+
 def find_edges(
     predictions: List[GamePrediction],
     odds: Dict[str, 'GameOdds'],
@@ -605,6 +766,7 @@ def run_daily_scan(
     use_odds: bool = True,
     min_edge: float = 0.02,
     odds_file: str = None,
+    games_file: str = None,
     manual_odds_input: bool = False
 ) -> Tuple[List[GamePrediction], List[BetRecommendation]]:
     """
@@ -615,7 +777,8 @@ def run_daily_scan(
         api_key: Odds API key
         use_odds: Whether to fetch odds from API
         min_edge: Minimum edge threshold
-        odds_file: Path to CSV file with odds
+        odds_file: Path to CSV file with odds only
+        games_file: Path to CSV file with full game input (IDs + odds)
         manual_odds_input: Whether to prompt for manual odds
 
     Returns:
@@ -627,8 +790,50 @@ def run_daily_scan(
     logger.info("Loading model...")
     model, feature_names = load_model_and_features()
 
-    # Get matchups
-    logger.info("Fetching lineups...")
+    # Check if using manual games file (full control with MLB IDs)
+    if games_file:
+        logger.info(f"Loading games from {games_file}...")
+        manual_games = parse_games_csv(games_file)
+        logger.info(f"Loaded {len(manual_games)} games from CSV")
+
+        if not manual_games:
+            logger.warning("No valid games in CSV file")
+            return [], []
+
+        # Run predictions from manual games
+        logger.info("Running predictions...")
+        predictions = []
+        odds = {}
+
+        for game in manual_games:
+            logger.info(f"  Predicting {game.away_team} @ {game.home_team}...")
+            pred = predict_manual_game(model, feature_names, game, date)
+            if pred:
+                predictions.append(pred)
+
+            # Build odds dict from manual games
+            if game.away_ml or game.home_ml or game.total:
+                key = f"{game.away_team} @ {game.home_team}"
+                odds[key] = type('GameOdds', (), {
+                    'fg_away_ml': game.away_ml,
+                    'fg_home_ml': game.home_ml,
+                    'fg_total': game.total,
+                    'fg_over_odds': game.over_odds,
+                    'fg_under_odds': game.under_odds
+                })()
+
+        logger.info(f"Successfully predicted {len(predictions)} games")
+
+        # Find edges
+        recommendations = []
+        if odds and predictions:
+            recommendations = find_edges(predictions, odds, min_edge)
+            logger.info(f"Found {len(recommendations)} edges >= {min_edge:.0%}")
+
+        return predictions, recommendations
+
+    # Standard flow: fetch from MLB API
+    logger.info("Fetching lineups from MLB API...")
     matchups = get_daily_matchups(date)
     logger.info(f"Found {len(matchups)} games")
 
@@ -697,41 +902,77 @@ def generate_odds_template(predictions: List[GamePrediction], filepath: str):
     print("Fill in the odds and run again with --odds-file")
 
 
+def generate_games_template(filepath: str):
+    """Generate a CSV template for full manual game input."""
+    with open(filepath, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'away_team', 'home_team',
+            'away_pitcher_id', 'away_pitcher_hand',
+            'home_pitcher_id', 'home_pitcher_hand',
+            'away_lineup_ids', 'home_lineup_ids',
+            'away_ml', 'home_ml', 'total', 'over_odds', 'under_odds'
+        ])
+        # Example row
+        writer.writerow([
+            'CIN', 'TEX',
+            '669270', 'R',
+            '666201', 'R',
+            '669016,663460,683658,664702,672284,608369,673357,670868,687093',
+            '543760,608369,686780,683002,666971,683734,682998,681082,660670',
+            '-110', '-110', '4.5', '-110', '-110'
+        ])
+
+    print(f"Games template saved to {filepath}")
+    print("\nColumns:")
+    print("  away_team, home_team: Team abbreviations (CIN, TEX, etc.)")
+    print("  away_pitcher_id, home_pitcher_id: MLB player IDs")
+    print("  away_pitcher_hand, home_pitcher_hand: L or R")
+    print("  away_lineup_ids, home_lineup_ids: Comma-separated MLB IDs in batting order")
+    print("  away_ml, home_ml, total, over_odds, under_odds: FanDuel F5 odds (optional)")
+    print("\nLook up MLB IDs at: https://baseballsavant.mlb.com/")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Daily F5 Scanner - Find betting edges",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Predictions only (no odds)
+    # Auto-fetch lineups, predictions only (no odds)
     python -m f5_model.model.daily_scanner --date 2026-04-04 --no-odds
 
-    # With manual odds from CSV
+    # Auto-fetch lineups, with manual odds from CSV
     python -m f5_model.model.daily_scanner --date 2026-04-04 --odds-file odds.csv
 
-    # Interactive mode - enter odds manually
-    python -m f5_model.model.daily_scanner --date 2026-04-04 --manual-odds
+    # RECOMMENDED: Full manual input with MLB IDs (most reliable)
+    python -m f5_model.model.daily_scanner --date 2026-04-04 --games-file games.csv
 
-    # Generate template CSV for entering odds
-    python -m f5_model.model.daily_scanner --date 2026-04-04 --template odds.csv
-
-    # With API (requires ODDS_API_KEY environment variable)
-    python -m f5_model.model.daily_scanner --date 2026-04-04 --api-key YOUR_KEY
+    # Generate templates for manual input
+    python -m f5_model.model.daily_scanner --template odds.csv
+    python -m f5_model.model.daily_scanner --games-template games.csv
         """
     )
     parser.add_argument("--date", "-d", default=datetime.now().strftime("%Y-%m-%d"),
                         help="Date to scan (YYYY-MM-DD)")
     parser.add_argument("--api-key", help="Odds API key (or set ODDS_API_KEY env var)")
     parser.add_argument("--no-odds", action="store_true", help="Skip fetching odds (model only)")
-    parser.add_argument("--odds-file", help="CSV file with FanDuel odds")
+    parser.add_argument("--odds-file", help="CSV file with FanDuel odds (uses MLB API for lineups)")
+    parser.add_argument("--games-file", help="CSV file with full game input (pitcher IDs, lineup IDs, odds)")
     parser.add_argument("--manual-odds", action="store_true", help="Enter odds interactively")
-    parser.add_argument("--template", help="Generate CSV template for odds input")
+    parser.add_argument("--template", help="Generate CSV template for odds-only input")
+    parser.add_argument("--games-template", help="Generate CSV template for full game input with IDs")
     parser.add_argument("--min-edge", type=float, default=0.02, help="Minimum edge threshold (default: 0.02)")
     parser.add_argument("--output", "-o", help="Output file path")
 
     args = parser.parse_args()
 
-    # If just generating template, run a quick scan first to get games
+    # Generate full games template
+    if args.games_template:
+        generate_games_template(args.games_template)
+        return
+
+    # Generate odds-only template
     if args.template:
         logger.info("Generating odds template...")
         model, feature_names = load_model_and_features()
@@ -764,6 +1005,7 @@ Examples:
         use_odds=not args.no_odds,
         min_edge=args.min_edge,
         odds_file=args.odds_file,
+        games_file=args.games_file,
         manual_odds_input=args.manual_odds
     )
 
