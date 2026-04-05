@@ -59,6 +59,39 @@ python -m f5_model.model.game_predict \
     --fd-home-rl-odds -102
 ```
 
+### Daily Scanner (All Games for a Day)
+```bash
+# Predictions only (no odds)
+python -m f5_model.model.daily_scanner --date 2026-04-04 --no-odds
+
+# Generate CSV template for manual odds entry
+python -m f5_model.model.daily_scanner --date 2026-04-04 --template odds.csv
+
+# With manual odds from CSV file
+python -m f5_model.model.daily_scanner --date 2026-04-04 --odds-file odds.csv
+
+# Interactive mode - enter odds at prompts
+python -m f5_model.model.daily_scanner --date 2026-04-04 --manual-odds
+
+# With The Odds API (requires API key)
+python -m f5_model.model.daily_scanner --date 2026-04-04 --api-key YOUR_KEY
+```
+
+### Daily Data Update
+```bash
+# Update yesterday's data
+python -m f5_model.scripts.daily_update
+
+# Update specific date
+python -m f5_model.scripts.daily_update --date 2026-04-03
+
+# Update date range
+python -m f5_model.scripts.daily_update --start 2026-04-01 --end 2026-04-03
+
+# Rebuild all features from raw data
+python -m f5_model.scripts.daily_update --rebuild-features
+```
+
 ## Project Structure
 
 ```
@@ -78,14 +111,19 @@ f5_model/
 │   ├── train.py                  # XGBoost with Poisson objective
 │   ├── evaluate.py               # MAE, calibration, over/under accuracy
 │   ├── predict.py                # Single pitcher CLI
-│   └── game_predict.py           # Full game CLI with edge finder
+│   ├── game_predict.py           # Full game CLI with edge finder
+│   └── daily_scanner.py          # Daily all-games scanner with edge finder
 ├── models/
 │   ├── f5_runs_model.pkl         # Trained XGBoost model
 │   ├── feature_names.txt         # 51 feature names
 │   └── evaluation_results.pkl    # Saved metrics
+├── scripts/
+│   └── daily_update.py           # Daily data update script
 └── utils/
     ├── statcast_pull.py          # Data fetching + F5 processing
-    └── constants.py              # LINEUP_WEIGHTS, PARK_FACTORS, etc.
+    ├── constants.py              # LINEUP_WEIGHTS, PARK_FACTORS, etc.
+    ├── lineup_scraper.py         # MLB Stats API lineup fetching
+    └── odds_api.py               # The Odds API integration
 ```
 
 ## CLI Reference
@@ -158,6 +196,54 @@ Predicts full F5 outcome for both teams, outputs all FanDuel betting markets.
 - `**VALUE**` = 5%+ edge (strong bet)
 - `*` = 2-5% edge (potential value)
 
+### daily_scanner.py (All Games for a Day)
+
+Scans all MLB games for a day, pulls lineups from MLB Stats API, runs predictions, and finds edges vs odds.
+
+| Flag | Description |
+|------|-------------|
+| `--date`, `-d` | Date to scan (default: today) |
+| `--no-odds` | Skip odds, show model predictions only |
+| `--odds-file` | Path to CSV file with FanDuel odds |
+| `--manual-odds` | Enter odds interactively at prompts |
+| `--template` | Generate CSV template for odds entry |
+| `--api-key` | The Odds API key (or set ODDS_API_KEY env) |
+| `--min-edge` | Minimum edge threshold (default: 0.02) |
+| `--output`, `-o` | Save output to file |
+
+**CSV Format for odds-file:**
+```csv
+away_team,home_team,away_ml,home_ml,total,over_odds,under_odds
+NYY,BOS,-150,+130,4.5,-110,-110
+LAD,SF,+120,-140,5.0,-105,-115
+```
+
+**Workflow:**
+1. Run with `--template odds.csv` to generate blank CSV
+2. Fill in FanDuel odds in the CSV
+3. Run with `--odds-file odds.csv` to find edges
+
+**Output:**
+- All games with projected scores and favorites
+- Edges table showing model vs book with EV
+- Best bets section highlighting 5%+ edges
+
+### daily_update.py (Data Refresh)
+
+Updates Statcast data and feature tables for ongoing model use.
+
+| Flag | Description |
+|------|-------------|
+| `--date`, `-d` | Single date to update |
+| `--start` | Start of date range |
+| `--end` | End of date range |
+| `--rebuild-features` | Rebuild all features from raw data |
+
+**What it does:**
+1. Pulls Statcast pitch data for specified date(s)
+2. Appends to raw parquet files
+3. Updates pitcher and batter feature tables
+
 ## Key Implementation Details
 
 ### Lineup Weighting
@@ -190,19 +276,29 @@ PARK_FACTORS = {
 
 ## Maintenance / Updates
 
-### To update data for new games:
-```python
-from f5_model.utils.statcast_pull import pull_month
+### Daily Update Workflow
+```bash
+# Update yesterday's data (run daily)
+python -m f5_model.scripts.daily_update
 
-# Pull recent data
-df = pull_month("2026-04-01", "2026-04-30")
-# Then rebuild features and optionally retrain
+# Or update a specific date range
+python -m f5_model.scripts.daily_update --start 2026-04-01 --end 2026-04-07
+
+# Rebuild all features if needed
+python -m f5_model.scripts.daily_update --rebuild-features
 ```
 
-### To retrain model:
+### To retrain model (monthly):
 ```bash
 python -m f5_model.model.train
 python -m f5_model.model.evaluate
+```
+
+### Manual data pull (if needed):
+```python
+from f5_model.utils.statcast_pull import pull_month
+
+df = pull_month("2026-04-01", "2026-04-30")
 ```
 
 ## Notes
