@@ -293,6 +293,10 @@ class GamePrediction:
     game_time: str = ""
     # Edges vs book
     edges: Dict = field(default_factory=dict)
+    # Data quality tracking
+    confidence: float = 1.0  # 0-1, percentage of players with features
+    players_found: int = 0
+    players_total: int = 0
 
 
 @dataclass
@@ -304,8 +308,10 @@ class BetRecommendation:
     model_prob: float
     model_odds: int
     book_odds: Optional[int]
-    edge: float
-    ev: float  # Expected value per $100 bet
+    raw_edge: float      # Edge before confidence adjustment
+    adj_edge: float      # Edge after confidence discount
+    ev: float            # Expected value per $100 bet
+    confidence: float    # Data quality score (0-1)
 
 
 def prob_to_american(prob: float) -> int:
@@ -467,6 +473,21 @@ def predict_game(
 
         probs = compute_game_probs(away_lambda, home_lambda)
 
+        # Calculate confidence based on data quality
+        # Total players: 2 pitchers + batters in both lineups
+        players_found = (
+            (1 if away_result.get('pitcher_found', False) else 0) +
+            (1 if home_result.get('pitcher_found', False) else 0) +
+            away_result.get('lineup_batters_found', 0) +
+            home_result.get('lineup_batters_found', 0)
+        )
+        players_total = (
+            2 +  # Both pitchers
+            away_result.get('lineup_total', len(away_lineup_ids)) +
+            home_result.get('lineup_total', len(home_lineup_ids))
+        )
+        confidence = players_found / players_total if players_total > 0 else 0
+
         return GamePrediction(
             away_team=matchup.away_abbrev,
             home_team=matchup.home_abbrev,
@@ -479,7 +500,10 @@ def predict_game(
             home_win_prob=probs['home_ml'],
             tie_prob=probs['tie'],
             game_time=matchup.game_time,
-            edges={'probs': probs}
+            edges={'probs': probs},
+            confidence=confidence,
+            players_found=players_found,
+            players_total=players_total
         )
 
     except Exception as e:
@@ -543,6 +567,20 @@ def predict_manual_game(
 
         probs = compute_game_probs(away_lambda, home_lambda)
 
+        # Calculate confidence based on data quality
+        players_found = (
+            (1 if away_result.get('pitcher_found', False) else 0) +
+            (1 if home_result.get('pitcher_found', False) else 0) +
+            away_result.get('lineup_batters_found', 0) +
+            home_result.get('lineup_batters_found', 0)
+        )
+        players_total = (
+            2 +  # Both pitchers
+            len(game.away_lineup_ids) +
+            len(game.home_lineup_ids)
+        )
+        confidence = players_found / players_total if players_total > 0 else 0
+
         return GamePrediction(
             away_team=game.away_team,
             home_team=game.home_team,
@@ -555,7 +593,10 @@ def predict_manual_game(
             home_win_prob=probs['home_ml'],
             tie_prob=probs['tie'],
             game_time="",
-            edges={'probs': probs}
+            edges={'probs': probs},
+            confidence=confidence,
+            players_found=players_found,
+            players_total=players_total
         )
 
     except Exception as e:
@@ -571,19 +612,23 @@ def find_edges(
     """
     Find betting edges by comparing model to book odds.
 
+    Edges are discounted by data quality (confidence) - a 10% raw edge
+    with 60% data quality becomes a 6% adjusted edge.
+
     Args:
         predictions: List of game predictions
         odds: Dict of game odds from API
-        min_edge: Minimum edge to include (default 2%)
+        min_edge: Minimum RAW edge to include (default 2%)
 
     Returns:
-        List of bet recommendations sorted by edge
+        List of bet recommendations sorted by ADJUSTED edge
     """
     recommendations = []
 
     for pred in predictions:
         game_key = f"{pred.away_team} @ {pred.home_team}"
         probs = pred.edges.get('probs', {})
+        confidence = pred.confidence
 
         # Try to find matching odds
         game_odds = None
@@ -599,9 +644,10 @@ def find_edges(
         if game_odds.fg_away_ml:
             model_prob = probs.get('away_ml', 0)
             book_prob = american_to_prob(game_odds.fg_away_ml)
-            edge = model_prob - book_prob
+            raw_edge = model_prob - book_prob
+            adj_edge = raw_edge * confidence
 
-            if edge >= min_edge:
+            if raw_edge >= min_edge:
                 recommendations.append(BetRecommendation(
                     game=game_key,
                     market="F5 ML",
@@ -609,16 +655,19 @@ def find_edges(
                     model_prob=model_prob,
                     model_odds=prob_to_american(model_prob),
                     book_odds=game_odds.fg_away_ml,
-                    edge=edge,
-                    ev=calculate_ev(model_prob, game_odds.fg_away_ml)
+                    raw_edge=raw_edge,
+                    adj_edge=adj_edge,
+                    ev=calculate_ev(model_prob, game_odds.fg_away_ml),
+                    confidence=confidence
                 ))
 
         if game_odds.fg_home_ml:
             model_prob = probs.get('home_ml', 0)
             book_prob = american_to_prob(game_odds.fg_home_ml)
-            edge = model_prob - book_prob
+            raw_edge = model_prob - book_prob
+            adj_edge = raw_edge * confidence
 
-            if edge >= min_edge:
+            if raw_edge >= min_edge:
                 recommendations.append(BetRecommendation(
                     game=game_key,
                     market="F5 ML",
@@ -626,8 +675,10 @@ def find_edges(
                     model_prob=model_prob,
                     model_odds=prob_to_american(model_prob),
                     book_odds=game_odds.fg_home_ml,
-                    edge=edge,
-                    ev=calculate_ev(model_prob, game_odds.fg_home_ml)
+                    raw_edge=raw_edge,
+                    adj_edge=adj_edge,
+                    ev=calculate_ev(model_prob, game_odds.fg_home_ml),
+                    confidence=confidence
                 ))
 
         # Check totals
@@ -639,40 +690,46 @@ def find_edges(
                     # Over
                     model_prob = probs_dict['over']
                     book_prob = american_to_prob(game_odds.fg_over_odds)
-                    edge = model_prob - book_prob
+                    raw_edge = model_prob - book_prob
+                    adj_edge = raw_edge * confidence
 
-                    if edge >= min_edge:
+                    if raw_edge >= min_edge:
                         recommendations.append(BetRecommendation(
                             game=game_key,
-                            market=f"F5 Total",
+                            market="F5 Total",
                             pick=f"Over {total_line}",
                             model_prob=model_prob,
                             model_odds=prob_to_american(model_prob),
                             book_odds=game_odds.fg_over_odds,
-                            edge=edge,
-                            ev=calculate_ev(model_prob, game_odds.fg_over_odds)
+                            raw_edge=raw_edge,
+                            adj_edge=adj_edge,
+                            ev=calculate_ev(model_prob, game_odds.fg_over_odds),
+                            confidence=confidence
                         ))
 
                     # Under
                     if game_odds.fg_under_odds:
                         model_prob = probs_dict['under']
                         book_prob = american_to_prob(game_odds.fg_under_odds)
-                        edge = model_prob - book_prob
+                        raw_edge = model_prob - book_prob
+                        adj_edge = raw_edge * confidence
 
-                        if edge >= min_edge:
+                        if raw_edge >= min_edge:
                             recommendations.append(BetRecommendation(
                                 game=game_key,
-                                market=f"F5 Total",
+                                market="F5 Total",
                                 pick=f"Under {total_line}",
                                 model_prob=model_prob,
                                 model_odds=prob_to_american(model_prob),
                                 book_odds=game_odds.fg_under_odds,
-                                edge=edge,
-                                ev=calculate_ev(model_prob, game_odds.fg_under_odds)
+                                raw_edge=raw_edge,
+                                adj_edge=adj_edge,
+                                ev=calculate_ev(model_prob, game_odds.fg_under_odds),
+                                confidence=confidence
                             ))
 
-    # Sort by edge descending
-    recommendations.sort(key=lambda x: x.edge, reverse=True)
+    # Sort by ADJUSTED edge descending
+    recommendations.sort(key=lambda x: x.adj_edge, reverse=True)
 
     return recommendations
 
@@ -680,7 +737,8 @@ def find_edges(
 def format_output(
     predictions: List[GamePrediction],
     recommendations: List[BetRecommendation],
-    date: str
+    date: str,
+    min_confidence: float = 0.75
 ) -> str:
     """Format the daily scanner output."""
     lines = []
@@ -689,47 +747,82 @@ def format_output(
     lines.append(f"F5 DAILY SCANNER - {date}")
     lines.append("=" * 80)
 
-    # Summary of all games
+    # Data Quality Summary - sorted by confidence
     lines.append(f"\n{'=' * 80}")
-    lines.append("ALL GAMES - MODEL PREDICTIONS")
+    lines.append("DATA QUALITY BY GAME")
     lines.append("=" * 80)
-    lines.append(f"\n  {'Game':<20} {'Pitchers':<35} {'Proj Score':<12} {'Total':<8} {'Fav':<8}")
-    lines.append("  " + "-" * 85)
 
-    for pred in sorted(predictions, key=lambda x: x.game_time):
-        pitchers = f"{pred.away_pitcher[:15]} vs {pred.home_pitcher[:15]}"
+    sorted_by_conf = sorted(predictions, key=lambda x: x.confidence, reverse=True)
+    for pred in sorted_by_conf:
+        pct = pred.confidence * 100
+        found = pred.players_found
+        total = pred.players_total
+
+        if pct >= 90:
+            icon = "🟢"
+        elif pct >= 75:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+
+        status = ""
+        if pct < min_confidence * 100:
+            status = " ⚠️ LOW DATA"
+
+        lines.append(f"  {icon} {pred.away_team} @ {pred.home_team}: {pct:.0f}% ({found}/{total}){status}")
+
+    # Summary of all games - sorted by confidence
+    lines.append(f"\n{'=' * 80}")
+    lines.append("ALL GAMES - MODEL PREDICTIONS (sorted by data quality)")
+    lines.append("=" * 80)
+    lines.append(f"\n  {'Game':<15} {'Data':<10} {'Pitchers':<30} {'Score':<10} {'Total':<7} {'Fav':<10}")
+    lines.append("  " + "-" * 90)
+
+    for pred in sorted_by_conf:
+        pitchers = f"{pred.away_pitcher[:12]} vs {pred.home_pitcher[:12]}"
         score = f"{pred.away_runs:.1f} - {pred.home_runs:.1f}"
+        data_qual = f"{pred.confidence*100:.0f}%"
+
+        if pred.confidence < min_confidence:
+            data_qual += " ⚠️"
 
         if pred.away_win_prob > pred.home_win_prob:
             fav = f"{pred.away_team} {prob_to_american(pred.away_win_prob)}"
         else:
             fav = f"{pred.home_team} {prob_to_american(pred.home_win_prob)}"
 
-        lines.append(f"  {pred.away_team} @ {pred.home_team:<13} {pitchers:<35} {score:<12} {pred.total:<8.1f} {fav:<8}")
+        lines.append(f"  {pred.away_team} @ {pred.home_team:<8} {data_qual:<10} {pitchers:<30} {score:<10} {pred.total:<7.1f} {fav:<10}")
 
     # Top edges
     if recommendations:
         lines.append(f"\n{'=' * 80}")
-        lines.append("TOP EDGES vs FANDUEL")
+        lines.append("TOP EDGES vs FANDUEL (sorted by adjusted edge)")
         lines.append("=" * 80)
-        lines.append(f"\n  {'Game':<22} {'Market':<12} {'Pick':<15} {'Model':<8} {'Book':<8} {'Edge':<8} {'EV':<8}")
-        lines.append("  " + "-" * 85)
+        lines.append(f"\n  {'Game':<18} {'Market':<10} {'Pick':<12} {'Model':<7} {'Book':<7} {'Raw':<7} {'Adj':<7} {'Data':<6} {'EV':<8}")
+        lines.append("  " + "-" * 95)
 
         for rec in recommendations[:15]:  # Top 15
             model_odds = f"{rec.model_odds:+d}" if rec.model_odds else "N/A"
             book_odds = f"{rec.book_odds:+d}" if rec.book_odds else "N/A"
-            edge_str = f"{rec.edge:.1%}"
+            raw_str = f"{rec.raw_edge:.1%}"
+            adj_str = f"{rec.adj_edge:.1%}"
+            data_str = f"{rec.confidence*100:.0f}%"
             ev_str = f"${rec.ev:+.1f}"
 
-            # Mark strong edges
-            if rec.edge >= 0.05:
-                edge_str += " **"
-            elif rec.edge >= 0.03:
-                edge_str += " *"
+            # Mark strong ADJUSTED edges
+            if rec.adj_edge >= 0.05:
+                adj_str += " **"
+            elif rec.adj_edge >= 0.03:
+                adj_str += " *"
 
-            lines.append(f"  {rec.game:<22} {rec.market:<12} {rec.pick:<15} {model_odds:<8} {book_odds:<8} {edge_str:<8} {ev_str:<8}")
+            # Warn on low data
+            if rec.confidence < min_confidence:
+                data_str += "⚠️"
 
-        lines.append("\n  Legend: ** = 5%+ edge (strong), * = 3-5% edge")
+            lines.append(f"  {rec.game:<18} {rec.market:<10} {rec.pick:<12} {model_odds:<7} {book_odds:<7} {raw_str:<7} {adj_str:<7} {data_str:<6} {ev_str:<8}")
+
+        lines.append("\n  Legend: ** = 5%+ adj edge (strong), * = 3-5% adj edge, ⚠️ = low data quality")
+        lines.append("  Raw = edge before data discount, Adj = edge × data quality %")
         lines.append("  EV = Expected Value per $100 bet")
 
     else:
@@ -742,19 +835,22 @@ def format_output(
         lines.append("    - Odds API doesn't have F5-specific markets")
         lines.append("    - Model sees no value today")
 
-    # Best bets summary
+    # Best bets summary - only show if ADJUSTED edge >= 5%
     if recommendations:
-        strong_edges = [r for r in recommendations if r.edge >= 0.05]
+        strong_edges = [r for r in recommendations if r.adj_edge >= 0.05]
         if strong_edges:
             lines.append(f"\n{'=' * 80}")
-            lines.append("BEST BETS (5%+ Edge)")
+            lines.append("BEST BETS (5%+ Adjusted Edge)")
             lines.append("=" * 80)
             for rec in strong_edges[:5]:
-                lines.append(f"\n  {rec.pick} ({rec.market})")
+                data_warning = " ⚠️ LOW DATA" if rec.confidence < min_confidence else ""
+                lines.append(f"\n  {rec.pick} ({rec.market}){data_warning}")
                 lines.append(f"    Game: {rec.game}")
+                lines.append(f"    Data Quality: {rec.confidence*100:.0f}%")
                 lines.append(f"    Model: {rec.model_prob:.1%} ({rec.model_odds:+d})")
                 lines.append(f"    Book:  {american_to_prob(rec.book_odds):.1%} ({rec.book_odds:+d})")
-                lines.append(f"    Edge:  {rec.edge:.1%}")
+                lines.append(f"    Raw Edge:  {rec.raw_edge:.1%}")
+                lines.append(f"    Adj Edge:  {rec.adj_edge:.1%}")
                 lines.append(f"    EV:    ${rec.ev:+.1f} per $100")
 
     return "\n".join(lines)
@@ -765,6 +861,7 @@ def run_daily_scan(
     api_key: str = None,
     use_odds: bool = True,
     min_edge: float = 0.02,
+    min_confidence: float = 0.75,
     odds_file: str = None,
     games_file: str = None,
     manual_odds_input: bool = False
@@ -777,6 +874,7 @@ def run_daily_scan(
         api_key: Odds API key
         use_odds: Whether to fetch odds from API
         min_edge: Minimum edge threshold
+        min_confidence: Minimum data quality to include in edge finding (default 75%)
         odds_file: Path to CSV file with odds only
         games_file: Path to CSV file with full game input (IDs + odds)
         manual_odds_input: Whether to prompt for manual odds
@@ -810,6 +908,9 @@ def run_daily_scan(
             pred = predict_manual_game(model, feature_names, game, date)
             if pred:
                 predictions.append(pred)
+                conf_pct = pred.confidence * 100
+                conf_warn = " ⚠️ LOW DATA" if pred.confidence < min_confidence else ""
+                logger.info(f"    Data quality: {conf_pct:.0f}% ({pred.players_found}/{pred.players_total}){conf_warn}")
 
             # Build odds dict from manual games
             if game.away_ml or game.home_ml or game.total:
@@ -824,11 +925,18 @@ def run_daily_scan(
 
         logger.info(f"Successfully predicted {len(predictions)} games")
 
-        # Find edges
+        # Log data quality summary
+        high_conf = [p for p in predictions if p.confidence >= min_confidence]
+        low_conf = [p for p in predictions if p.confidence < min_confidence]
+        logger.info(f"Data quality: {len(high_conf)} games >= {min_confidence*100:.0f}%, {len(low_conf)} games below threshold")
+
+        # Find edges (only on games meeting minimum confidence for recommendations)
         recommendations = []
         if odds and predictions:
-            recommendations = find_edges(predictions, odds, min_edge)
-            logger.info(f"Found {len(recommendations)} edges >= {min_edge:.0%}")
+            # Filter to high-confidence games for edge finding
+            high_conf_preds = [p for p in predictions if p.confidence >= min_confidence]
+            recommendations = find_edges(high_conf_preds, odds, min_edge)
+            logger.info(f"Found {len(recommendations)} edges >= {min_edge:.0%} (from {len(high_conf_preds)} high-data games)")
 
         return predictions, recommendations
 
@@ -877,14 +985,24 @@ def run_daily_scan(
         pred = predict_game(model, feature_names, matchup, date)
         if pred:
             predictions.append(pred)
+            conf_pct = pred.confidence * 100
+            conf_warn = " ⚠️ LOW DATA" if pred.confidence < min_confidence else ""
+            logger.info(f"    Data quality: {conf_pct:.0f}% ({pred.players_found}/{pred.players_total}){conf_warn}")
 
     logger.info(f"Successfully predicted {len(predictions)} games")
 
-    # Find edges
+    # Log data quality summary
+    high_conf = [p for p in predictions if p.confidence >= min_confidence]
+    low_conf = [p for p in predictions if p.confidence < min_confidence]
+    logger.info(f"Data quality: {len(high_conf)} games >= {min_confidence*100:.0f}%, {len(low_conf)} games below threshold")
+
+    # Find edges (only on games meeting minimum confidence for recommendations)
     recommendations = []
     if odds and predictions:
-        recommendations = find_edges(predictions, odds, min_edge)
-        logger.info(f"Found {len(recommendations)} edges >= {min_edge:.0%}")
+        # Filter to high-confidence games for edge finding
+        high_conf_preds = [p for p in predictions if p.confidence >= min_confidence]
+        recommendations = find_edges(high_conf_preds, odds, min_edge)
+        logger.info(f"Found {len(recommendations)} edges >= {min_edge:.0%} (from {len(high_conf_preds)} high-data games)")
 
     return predictions, recommendations
 
@@ -963,6 +1081,8 @@ Examples:
     parser.add_argument("--template", help="Generate CSV template for odds-only input")
     parser.add_argument("--games-template", help="Generate CSV template for full game input with IDs")
     parser.add_argument("--min-edge", type=float, default=0.02, help="Minimum edge threshold (default: 0.02)")
+    parser.add_argument("--min-confidence", type=float, default=0.75,
+                        help="Minimum data quality to include in edges (default: 0.75 = 75%%)")
     parser.add_argument("--output", "-o", help="Output file path")
 
     args = parser.parse_args()
@@ -1004,12 +1124,13 @@ Examples:
         api_key=args.api_key,
         use_odds=not args.no_odds,
         min_edge=args.min_edge,
+        min_confidence=args.min_confidence,
         odds_file=args.odds_file,
         games_file=args.games_file,
         manual_odds_input=args.manual_odds
     )
 
-    output = format_output(predictions, recommendations, args.date)
+    output = format_output(predictions, recommendations, args.date, min_confidence=args.min_confidence)
     print(output)
 
     if args.output:

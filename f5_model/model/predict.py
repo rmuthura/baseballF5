@@ -310,7 +310,9 @@ def predict_f5_runs(
         'predicted_runs': float(lambda_pred),
         'probabilities': probs,
         'over_under': over_under,
-        'lineup_batters_found': lineup_features.get('lineup_batters_found', 0)
+        'lineup_batters_found': lineup_features.get('lineup_batters_found', 0),
+        'lineup_total': len(lineup_ids),
+        'pitcher_found': len(pitcher_features) > 0
     }
 
 
